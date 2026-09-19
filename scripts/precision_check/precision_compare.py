@@ -11,17 +11,23 @@ Compares .npy files between two directories and reports differences.
 import argparse
 import os
 import sys
+import re
 from pathlib import Path
 
 import numpy as np
 
+WRAPPER_RE = re.compile(r"^(Sequential|TransformerChunk|Transformer)(?:_\d+)?_(forward|backward)\.npy$)")
 
-def find_npy_files(directory: str) -> dict[str, Path]:
+def find_npy_files(directory: str, match_by_basename: bool = False) -> dict[str, Path]:
     """Find all .npy files in directory (recursively)."""
     files = {}
-    for path in Path(directory).rglob("*.npy"):
-        rel_path = path.relative_to(directory)
-        files[str(rel_path)] = path
+    for path in sorted(Path(directory).rglob("*.npy")):
+        if match_by_basename and WRAPPER_RE.fullmatch(path.name):
+            continue
+        key = path.name if match_by_basename else str(path.relative_to(directory))
+        if key in files:
+            raise ValueError(f"Duplicate tensor name {key}: {files[key]} and {path}")
+        files[key] = path
     return files
 
 
@@ -46,6 +52,9 @@ def compare_tensors(file1: Path, file2: Path, atol: float, rtol: float) -> dict:
 
     if arr1.dtype != arr2.dtype:
         result["error"] = f"Dtype mismatch: {arr1.dtype} vs {arr2.dtype}"
+        return result
+    if not np.isfinite(arr1).all() or not np.isfinite(arr2).all():
+        result["error"] = "NaN or Inf in tensor"
         return result
 
     arr1_flat = arr1.astype(np.float64).flatten()
@@ -77,7 +86,12 @@ def main():
     parser.add_argument("--atol", type=float, default=1e-5, help="Absolute tolerance")
     parser.add_argument("--rtol", type=float, default=1e-3, help="Relative tolerance")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    parser.add_argument("--match-by-basename", action="store_true")
+    parser.add_argument("--strict-file-set", action="store_true")
     args = parser.parse_args()
+
+    if not all(np.isfinite(x) and x >= 0 for x in (args.atol, args.rtol)):
+        parser.error("atol and rtol must finite and nonnegative")
 
     if not os.path.isdir(args.dir1):
         print(f"Error: {args.dir1} is not a directory")
@@ -86,8 +100,8 @@ def main():
         print(f"Error: {args.dir2} is not a directory")
         sys.exit(1)
 
-    files1 = find_npy_files(args.dir1)
-    files2 = find_npy_files(args.dir2)
+    files1 = find_npy_files(args.dir1, args.match_by_basename)
+    files2 = find_npy_files(args.dir2, args.match_by_basename)
 
     print(f"Directory 1: {args.dir1} ({len(files1)} files)")
     print(f"Directory 2: {args.dir2} ({len(files2)} files)")
@@ -145,7 +159,7 @@ def main():
     print(f"Summary: {passed} passed, {failed} failed, {errors} errors")
     print(f"Missing: {len(only_in_1)} in dir1 only, {len(only_in_2)} in dir2 only")
 
-    if failed > 0 or errors > 0:
+    if failed > 0 or errors > 0 or (args.strict_file_set and (only_in_1 or only_in_2)):
         sys.exit(1)
 
 

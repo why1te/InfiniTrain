@@ -1,10 +1,16 @@
+#include "example/common/parser.h"
+#include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <format>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <thread>
 #include <unordered_set>
+#include <vector>
 
 #include "gflags/gflags.h"
 #include "glog/logging.h"
@@ -33,6 +39,7 @@
 #include "infini_train/include/optimizer.h"
 #include "infini_train/include/utils/global_module_hook_registry.h"
 #include "infini_train/include/utils/precision_check_config.h"
+#include "infini_train/include/utils/pipeline_diagnostics.h"
 #include "infini_train/include/utils/precision_checker.h"
 #ifdef PROFILE_MODE
 #include "infini_train/include/profiler.h"
@@ -125,21 +132,27 @@ DEFINE_validator(zero_stage, [](const char *, int32_t value) { return value >= 0
 DEFINE_validator(lr_decay_style,
                  [](const char *, const std::string &value) { return kSupportedLRDecayStyles.contains(value); });
 
-void Train(const nn::parallel::Rank &rank) {
+DEFINE_string(pipeline_layer_partition, "", "Layer counts in global chunk order; requires PP * vPP entries.");
+DEFINE_string(pipeline_chunk_layout, "", "Ordered stage:layer_count entries with explicit chunk owners.");
+
+DEFINE_bool(pipeline_benchmark_sync, false, "Synchronize PP steps for comparable benchmark timing.");
+DEFINE_bool(pipeline_task_nvtx, false, "Add Pipeline step/task NVTX ranges for trace attribution.");
+DEFINE_string(dump_parameter_gradients, "", "First-step parameter gradient output directory.");
+DEFINE_string(pipeline_task_times, "", "Synchronized per-stage diagnostic output directory.");
+
+void Train(const nn::parallel::Rank &rank, examples::PipelineLayoutRequest layout_request) try {
     using namespace nn::parallel;
 
     {
         if (rank.IsLastRank()) {
             if (!FLAGS_save.empty() && FLAGS_save_interval == 0) {
                 LOG(FATAL) << "Invalid configuration: --save is set ('" << FLAGS_save
-                           << "'), but --save_interval is 0. "
-                           << "They must be set together.";
+                           << "'), but --save_interval is 0. " << "They must be set together.";
             }
 
             if (FLAGS_save.empty() && FLAGS_save_interval > 0) {
                 LOG(FATAL) << "Invalid configuration: --save_interval is set to " << FLAGS_save_interval
-                           << ", but --save is empty. "
-                           << "They must be set together.";
+                           << ", but --save is empty. " << "They must be set together.";
             }
         }
     }
@@ -151,6 +164,10 @@ void Train(const nn::parallel::Rank &rank) {
     int tp_world_size = global::GetTensorParallelSize();
     int sp_world_size = global::GetSequenceParallelEnabled() ? tp_world_size : 1;
     int pp_world_size = global::GetPipelineParallelSize();
+    const bool explicit_chunk_mode = examples::IsExplicitChunkRequest(layout_request);
+    if (explicit_chunk_mode && ddp_world_size != 1) {
+        throw std::invalid_argument("explicit chunks currently require DP=1");
+    }
 
     if (FLAGS_sequence_parallel) {
         CHECK_EQ(FLAGS_sequence_length % tp_world_size, 0)
@@ -212,15 +229,27 @@ void Train(const nn::parallel::Rank &rank) {
     nn::TransformerConfig model_config = llama3::LLaMA3Config();
     std::shared_ptr<nn::Module> model = nullptr;
     if (!FLAGS_llmc_filepath.empty()) {
-        model = llama3::LoadFromLLMC(FLAGS_llmc_filepath);
+        model = llama3::LoadFromLLMC(FLAGS_llmc_filepath, layout_request);
     } else {
         llama3::SanitizeLLaMA3Config(model_config);
-        model = std::make_shared<nn::TransformerModel>(model_config);
+        const auto layout = examples::ResolvePipelineLayout(model_config.n_layer, pp_world_size,
+                                                            FLAGS_virtual_pipeline_parallel, layout_request);
+        model = layout ? std::make_shared<nn::TransformerModel>(model_config, layout, pp_rank)
+                       : std::make_shared<nn::TransformerModel>(model_config);
+    }
+
+    const auto llama3_model = std::dynamic_pointer_cast<nn::TransformerModel>(model);
+    CHECK(llama3_model) << "LLaMA 3 example expects TransformerModel.";
+    model_config = llama3_model->Config();
+
+    const auto pipeline_layout = llama3_model->GetPipelineLayout();
+    if (rank.GlobalRank() == 0 && pipeline_layout) {
+        LOG(INFO) << examples::FormatPipelineLayout(*pipeline_layout);
     }
 
     model->To(device);
 
-    utils::PrecisionChecker::BuildNameMap(model.get());
+    utils::PrecisionChecker::BuildNameMap(model.get(), pipeline_layout, pp_rank);
 
     // Apply LoRA using GetLoRAModel (in-place injection)
     bool lora_enabled = FLAGS_lora_rank > 0;
@@ -260,8 +289,13 @@ void Train(const nn::parallel::Rank &rank) {
         auto shapes = std::vector<std::vector<int64_t>>{
             {FLAGS_batch_size, FLAGS_sequence_length / sp_world_size, model_config.n_embd}};
 
-        model = std::make_shared<nn::parallel::PipelineParallel>(model, pp_world_size, num_micro_batches, shapes,
-                                                                 pp_rank, device, model_config.GetChunkSize());
+        if (pipeline_layout) {
+            model = std::make_shared<nn::parallel::PipelineParallel>(
+                model, pp_world_size, num_micro_batches, shapes, pp_rank, device, pipeline_layout, explicit_chunk_mode);
+        } else {
+            model = std::make_shared<nn::parallel::PipelineParallel>(model, pp_world_size, num_micro_batches, shapes,
+                                                                     pp_rank, device, model_config.GetChunkSize());
+        }
         if (ddp_world_size > 1) {
             auto ddp_config = DistributedDataParallelConfig{.zero_stage = FLAGS_zero_stage};
             auto *mutable_chunks = dynamic_cast<nn::parallel::PipelineParallel *>(model.get())->mutable_chunks();
@@ -352,6 +386,16 @@ void Train(const nn::parallel::Rank &rank) {
     LOG(INFO) << "Rank " << rank.GlobalRank() << ": start training";
 
     auto impl = core::GetDeviceGuardImpl(device.type());
+    auto benchmark_fence = [&]() {
+        if (!FLAGS_pipeline_benchmark_sync) return;
+        impl->SynchronizeDevice(device);
+        if (pp_world_size > 1) {
+            float zero = 0.0f;
+            auto token = std::make_shared<Tensor>(&zero, std::vector<int64_t>{}, DataType::kFLOAT32, device);
+            function::AllReduce(token, function::ReduceOpType::kSum, pp_pg);
+            impl->SynchronizeDevice(device);
+        }
+    };
 
     int start_step = 0;
     TrainerState state;
@@ -412,6 +456,30 @@ void Train(const nn::parallel::Rank &rank) {
         });
     };
 
+    std::unique_ptr<utils::PipelineDiagnostics> diagnostics;
+    if (!FLAGS_dump_parameter_gradients.empty() || !FLAGS_pipeline_task_times.empty()) {
+        if (ddp_world_size != 1 || tp_world_size != 1 || FLAGS_lora_rank > 0 || dtype != DataType::kFLOAT32) {
+            throw std::invalid_argument("diagnostics require FP32, DP=TP=1 and no LoRA");
+        }
+        if (!FLAGS_pipeline_task_times.empty() && pp_world_size < 2) {
+            throw std::invalid_argument("task timing requires PP >= 2");
+        }
+#ifdef PROFILE_MODE
+        if (!FLAGS_pipeline_task_times.empty()) {
+            throw std::invalid_argument("task timing must use PROFILE_MODE=OFF");
+        }
+#endif
+        diagnostics = std::make_unique<utils::PipelineDiagnostics>(
+            llama3_model,
+            [pipeline_layout, pp_rank](const std::string &name) {
+                return utils::ToDiagnosticParameterName(name, pipeline_layout, pp_rank);
+            },
+            device, pp_rank,
+            pp_rank == (pipeline_layout ? pipeline_layout->GetOutputStage() : pp_world_size - 1),
+            FLAGS_dump_parameter_gradients, FLAGS_pipeline_task_times);
+    }
+    utils::PipelineDiagnosticsScope diagnostic_scope(diagnostics.get());
+
     for (int step = start_step; step < FLAGS_num_iteration + 1; ++step) {
         // Reset precision check counters at start of each iteration for file overwrite
         utils::PrecisionChecker::ResetCounters();
@@ -420,6 +488,7 @@ void Train(const nn::parallel::Rank &rank) {
 
         impl->ResetMemPoolHighWatermarks(device);
 
+        benchmark_fence();
         const auto iter_start = std::chrono::high_resolution_clock::now();
 
         // once in a while evaluate the validation dataset
@@ -445,6 +514,8 @@ void Train(const nn::parallel::Rank &rank) {
 
         const float current_lr = scheduler ? scheduler->learning_rate() : static_cast<float>(FLAGS_learning_rate);
         float lossf = 0.0f;
+        if (diagnostics) { diagnostics->BeginStep(step); }
+        utils::PipelineTaskTraceStep trace_step(step, FLAGS_pipeline_task_nvtx && pp_world_size > 1);
         if (pp_world_size == 1) {
             // model->Train();
             optimizer->ZeroGrad();
@@ -489,12 +560,14 @@ void Train(const nn::parallel::Rank &rank) {
                 LOG(INFO) << "Rank " << rank.GlobalRank() << ": finish backward";
             }
 
+            utils::DumpPipelineParameterGradients();
             optimizer->Step();
             if (scheduler) {
                 scheduler->Step();
             }
         } else {
             auto [x, y] = next_train_batch();
+            if (diagnostics) { diagnostics->RecordBatch(*x, *y); }
             x = std::make_shared<Tensor>(x->To(device));
             y = std::make_shared<Tensor>(y->To(device));
 
@@ -510,11 +583,16 @@ void Train(const nn::parallel::Rank &rank) {
             lossf = static_cast<const float *>(lossf_tensor->To(Device()).DataPtr())[0];
         }
 
+        benchmark_fence();
+        if (diagnostics) { diagnostics->EndStep(lossf); }
         const auto iter_end = std::chrono::high_resolution_clock::now();
         const double duration_us = std::chrono::duration<double, std::micro>(iter_end - iter_start).count();
         const double tps = FLAGS_total_batch_size / (duration_us / 1e6);
 
-        if (rank.IsLastRank()) {
+        // PP loss is local: only the logical output stage has a valid value.
+        // Select one DP/TP replica for logging; the DP AllReduce above remains collective.
+        const int output_stage = pipeline_layout ? pipeline_layout->GetOutputStage() : pp_world_size - 1;
+        if (pp_rank == output_stage && ddp_rank == ddp_world_size - 1 && tp_rank == tp_world_size - 1) {
             size_t used_mb = 0, reserved_mb = 0;
             std::tie(used_mb, reserved_mb) = impl->GetMemPoolPeakMB(device);
             LOG(ERROR) << std::format("step {:4d}/{} | train loss {:.6f} | lr {:.2e} | ({:.2f} ms | {:.0f} tok/s | "
@@ -523,7 +601,7 @@ void Train(const nn::parallel::Rank &rank) {
                                       used_mb, reserved_mb, ddp_world_size, tp_world_size, sp_world_size,
                                       pp_world_size);
 
-            if ((step + 1) % FLAGS_freq_generate_txt == 0) {
+            if (FLAGS_freq_generate_txt > 0 && (step + 1) % FLAGS_freq_generate_txt == 0) {
                 // FIXME(jym): to support PP
                 if (tokenizer) {
                     CHECK_EQ(pp_world_size, 1);
@@ -554,11 +632,39 @@ void Train(const nn::parallel::Rank &rank) {
     Profiler::Instance().Report("llama3.report", Profiler::SortBy::DeviceTimePercentage);
     Profiler::Instance().PrintRecords("llama3.records.log");
 #endif
+} catch (const std::exception &error) {
+    LOG(FATAL) << "Rank " << rank.GlobalRank() << ": --pipeline_layer_partition=\"" << FLAGS_pipeline_layer_partition
+               << "\", --pipeline_chunk_layout=\"" << FLAGS_pipeline_chunk_layout << "\": " << error.what();
 }
 
 int main(int argc, char *argv[]) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     google::InitGoogleLogging(argv[0]);
+
+    examples::PipelineLayoutRequest layout_request;
+    try {
+        const auto limit = static_cast<uint32_t>(std::numeric_limits<int>::max());
+        if (FLAGS_pipeline_parallel == 0 || FLAGS_virtual_pipeline_parallel == 0 || FLAGS_pipeline_parallel > limit
+            || FLAGS_virtual_pipeline_parallel > limit
+            || FLAGS_pipeline_parallel > limit / FLAGS_virtual_pipeline_parallel) {
+            throw std::invalid_argument("PP/vPP must be positive and their product must fit int");
+        }
+        layout_request
+            = examples::ParsePipelineLayoutRequest(FLAGS_pipeline_layer_partition, FLAGS_pipeline_chunk_layout,
+                                                   FLAGS_pipeline_parallel, FLAGS_virtual_pipeline_parallel);
+        if (examples::IsExplicitChunkRequest(layout_request)
+            && (FLAGS_pipeline_parallel < 2 || FLAGS_tensor_parallel != 1 || FLAGS_sequence_parallel
+                || FLAGS_freq_generate_txt != 0 || FLAGS_val_loss_every != 0 || FLAGS_sample_every != 0)) {
+            throw std::invalid_argument(
+                "explicit chunks require PP>=2, TP=SP=1/off, and generation/validation disabled");
+        }
+    } catch (const std::exception &error) {
+        LOG(ERROR) << "Invalid --pipeline_layer_partition=" << FLAGS_pipeline_layer_partition
+                   << ", --pipeline_chunk_layout=" << FLAGS_pipeline_chunk_layout << ", PP=" << FLAGS_pipeline_parallel
+                   << ", vPP=" << FLAGS_virtual_pipeline_parallel << ": " << error.what();
+        google::ShutdownGoogleLogging();
+        return EXIT_FAILURE;
+    }
 
     auto precision_config = utils::PrecisionCheckConfig::Parse(FLAGS_precision_check);
     nn::parallel::global::InitAllEnv(FLAGS_nthread_per_process, FLAGS_tensor_parallel, FLAGS_sequence_parallel,
@@ -572,14 +678,14 @@ int main(int argc, char *argv[]) {
         for (int idx = 0; idx < FLAGS_nthread_per_process; ++idx) {
             nn::parallel::Rank rank(nn::parallel::global::GetGlobalProcRank(), idx,
                                     nn::parallel::global::GetNprocPerNode(), FLAGS_nthread_per_process);
-            threads.emplace_back(Train, rank);
+            threads.emplace_back(Train, rank, layout_request);
         }
 
         for (auto &thread : threads) { thread.join(); }
     } else {
         nn::parallel::Rank rank(nn::parallel::global::GetGlobalProcRank(), 0, nn::parallel::global::GetNprocPerNode(),
                                 FLAGS_nthread_per_process);
-        Train(rank);
+        Train(rank, layout_request);
     }
 
     gflags::ShutDownCommandLineFlags();
