@@ -1,6 +1,9 @@
 #include "infini_train/include/nn/parallel/pp/send_recv.h"
 
+#include <limits>
 #include <memory>
+#include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include "glog/logging.h"
@@ -10,6 +13,7 @@
 #include "infini_train/include/nn/parallel/process_group.h"
 #include "infini_train/include/nn/parallel/utils.h"
 #include "infini_train/include/tensor.h"
+#include "infini_train/include/utils/pipeline_diagnostics.h"
 
 namespace infini_train::nn::parallel {
 
@@ -18,8 +22,10 @@ class ISend : public autograd::Function {
 public:
     static constexpr char kType[] = "ISendFunction";
 
-    explicit ISend(Device target_device, int peer_rank, const std::vector<std::vector<int64_t>> &shape)
-        : autograd::Function(kType), target_device_(target_device), peer_rank_(peer_rank), shapes_(shape) {}
+    explicit ISend(Device target_device, int peer_rank, const std::vector<std::vector<int64_t>> &shape, int trace_step,
+                   int microbatch, int boundary)
+        : autograd::Function(kType), target_device_(target_device), peer_rank_(peer_rank), shapes_(shape),
+          trace_step_(trace_step), microbatch_(microbatch), boundary_(boundary) {}
 
     std::vector<std::shared_ptr<Tensor>> Forward(const std::vector<std::shared_ptr<Tensor>> &input_tensors) override;
 
@@ -30,14 +36,18 @@ private:
     Device input_device_;
     int peer_rank_ = -1;
     const std::vector<std::vector<int64_t>> &shapes_;
+    int trace_step_ = -1;
+    int microbatch_ = -1;
+    int boundary_ = -1;
 };
 
 class IRecv : public autograd::Function {
 public:
     static constexpr char kType[] = "IRecvFunction";
 
-    explicit IRecv(Device src_device, int peer_rank)
-        : autograd::Function(kType), src_device_(src_device), peer_rank_(peer_rank) {}
+    explicit IRecv(Device src_device, int peer_rank, int trace_step, int microbatch, int boundary)
+        : autograd::Function(kType), src_device_(src_device), peer_rank_(peer_rank), trace_step_(trace_step),
+          microbatch_(microbatch), boundary_(boundary) {}
 
     std::vector<std::shared_ptr<Tensor>> Forward(const std::vector<std::shared_ptr<Tensor>> &input_tensors) override;
 
@@ -50,7 +60,28 @@ private:
     Device src_device_;
     Device cur_device_;
     int peer_rank_ = -1;
+    int trace_step_ = -1;
+    int microbatch_ = -1;
+    int boundary_ = -1;
 };
+
+std::pair<std::size_t, std::size_t> TracePayload(const std::vector<std::shared_ptr<Tensor>> &tensors, int trace_step) {
+    if (trace_step < 0) {
+        return {0, 0};
+    }
+    std::size_t bytes = 0;
+    for (const auto &tensor : tensors) {
+        if (!tensor || tensor->SizeInBytes() == 0
+            || bytes > std::numeric_limits<std::size_t>::max() - tensor->SizeInBytes()) {
+            throw std::invalid_argument("invalid pipeline P2P trace payload");
+        }
+        bytes += tensor->SizeInBytes();
+    }
+    if (tensors.empty()) {
+        throw std::invalid_argument("empty pipeline P2P trace payload");
+    }
+    return {bytes, tensors.size()};
+}
 
 std::vector<std::shared_ptr<Tensor>> ISend::Forward(const std::vector<std::shared_ptr<Tensor>> &input_tensors) {
     const auto &input = input_tensors[0];
@@ -59,6 +90,9 @@ std::vector<std::shared_ptr<Tensor>> ISend::Forward(const std::vector<std::share
     auto pp_group = ProcessGroupFactory::Instance(input_device_.type())
                         ->Get(GetPipelineParallelProcessGroupName(input_device_.Rank().GlobalRank()));
 
+    const auto [bytes, tensors] = TracePayload(input_tensors, trace_step_);
+    utils::PipelineP2PTrace trace(trace_step_, microbatch_, boundary_, peer_rank_, bytes, tensors,
+                                  /*forward=*/true, /*send=*/true);
     pp_group->Send(input_tensors, peer_rank_, false);
 
     return input_tensors;
@@ -75,6 +109,9 @@ std::vector<std::shared_ptr<Tensor>> ISend::Backward(const std::vector<std::shar
     auto pp_group = ProcessGroupFactory::Instance(input_device_.type())
                         ->Get(GetPipelineParallelProcessGroupName(input_device_.Rank().GlobalRank()));
 
+    const auto [bytes, tensors] = TracePayload(recv_tensors, trace_step_);
+    utils::PipelineP2PTrace trace(trace_step_, microbatch_, boundary_, peer_rank_, bytes, tensors,
+                                  /*forward=*/false, /*send=*/false);
     pp_group->Recv(recv_tensors, peer_rank_, false);
 
     return recv_tensors;
@@ -83,6 +120,9 @@ std::vector<std::shared_ptr<Tensor>> ISend::Backward(const std::vector<std::shar
 std::vector<std::shared_ptr<Tensor>> IRecv::Forward(const std::vector<std::shared_ptr<Tensor>> &recv_tensors) {
     auto pp_group = ProcessGroupFactory::Instance(src_device_.type())
                         ->Get(GetPipelineParallelProcessGroupName(src_device_.Rank().GlobalRank()));
+    const auto [bytes, tensors] = TracePayload(recv_tensors, trace_step_);
+    utils::PipelineP2PTrace trace(trace_step_, microbatch_, boundary_, peer_rank_, bytes, tensors,
+                                  /*forward=*/true, /*send=*/false);
     pp_group->Recv(recv_tensors, peer_rank_, false);
 
     return recv_tensors;
@@ -100,6 +140,9 @@ std::vector<std::shared_ptr<Tensor>> IRecv::Backward(const std::vector<std::shar
     auto pp_group = ProcessGroupFactory::Instance(cur_device_.type())
                         ->Get(GetPipelineParallelProcessGroupName(cur_device_.Rank().GlobalRank()));
 
+    const auto [bytes, tensors] = TracePayload(grad_outputs, trace_step_);
+    utils::PipelineP2PTrace trace(trace_step_, microbatch_, boundary_, peer_rank_, bytes, tensors,
+                                  /*forward=*/false, /*send=*/true);
     pp_group->Send(grad_outputs, peer_rank_, false);
 
     return grad_outputs;
@@ -108,14 +151,15 @@ std::vector<std::shared_ptr<Tensor>> IRecv::Backward(const std::vector<std::shar
 
 std::vector<std::shared_ptr<Tensor>> ISend(const std::vector<std::shared_ptr<Tensor>> &input_tensors,
                                            Device target_device, int peer_rank,
-                                           const std::vector<std::vector<int64_t>> &shape) {
-    auto func = std::make_shared<functions::ISend>(target_device, peer_rank, shape);
+                                           const std::vector<std::vector<int64_t>> &shape, int trace_step,
+                                           int microbatch, int boundary) {
+    auto func = std::make_shared<functions::ISend>(target_device, peer_rank, shape, trace_step, microbatch, boundary);
     return func->Apply(input_tensors);
 }
 
 std::vector<std::shared_ptr<Tensor>> IRecv(const std::vector<std::shared_ptr<Tensor>> &outputs, Device src_device,
-                                           int peer_rank) {
-    auto func = std::make_shared<functions::IRecv>(src_device, peer_rank);
+                                           int peer_rank, int trace_step, int microbatch, int boundary) {
+    auto func = std::make_shared<functions::IRecv>(src_device, peer_rank, trace_step, microbatch, boundary);
     return func->Apply(outputs);
 }
 } // namespace infini_train::nn::parallel

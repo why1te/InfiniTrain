@@ -7,6 +7,7 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -246,6 +247,61 @@ inline void DumpPipelineParameterGradients() {
 #ifdef USE_CUDA
 inline thread_local int active_pipeline_trace_step = -1;
 #endif
+inline int CurrentPipelineTraceStep() {
+#ifdef USE_CUDA
+    return active_pipeline_trace_step;
+#else
+    return -1;
+#endif
+}
+inline std::string BuildPipelineP2PTraceLabel(int step, int mb, int boundary, int peer, std::size_t bytes,
+                                              std::size_t tensors, bool forward, bool send) {
+    if (step < 0 || mb < 0 || boundary < 0 || peer < 0 || bytes == 0 || tensors == 0) {
+        throw std::invalid_argument("invalid pipeline P2P trace metadata");
+    }
+    const auto direction = forward ? "forward" : "backward";
+    return "pipeline p2p step=" + std::to_string(step) + " mb=" + std::to_string(mb)
+         + " boundary=" + std::to_string(boundary) + " direction=" + direction + " role=" + (send ? "send" : "recv")
+         + " peer=" + std::to_string(peer) + " bytes=" + std::to_string(bytes) + " tensors=" + std::to_string(tensors)
+         + " message=" + std::to_string(step) + ':' + std::to_string(mb) + ':' + std::to_string(boundary) + ':'
+         + direction;
+}
+class PipelineP2PTrace {
+public:
+    PipelineP2PTrace(int step, int mb, int boundary, int peer, std::size_t bytes, std::size_t tensors, bool forward,
+                     bool send) {
+#ifdef USE_CUDA
+        if (step >= 0) {
+            const auto label = BuildPipelineP2PTraceLabel(step, mb, boundary, peer, bytes, tensors, forward, send);
+            nvtxRangePushA(label.c_str());
+            enabled_ = true;
+        }
+#else
+        (void)step;
+        (void)mb;
+        (void)boundary;
+        (void)peer;
+        (void)bytes;
+        (void)tensors;
+        (void)forward;
+        (void)send;
+#endif
+    }
+    ~PipelineP2PTrace() {
+#ifdef USE_CUDA
+        if (enabled_) {
+            nvtxRangePop();
+        }
+#endif
+    }
+    PipelineP2PTrace(const PipelineP2PTrace &) = delete;
+    PipelineP2PTrace &operator=(const PipelineP2PTrace &) = delete;
+
+private:
+#ifdef USE_CUDA
+    bool enabled_ = false;
+#endif
+};
 // An optional outer range gives Nsight a training-step label for nested task ranges.
 class PipelineTaskTraceStep {
 public:

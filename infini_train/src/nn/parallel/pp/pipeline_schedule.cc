@@ -66,7 +66,7 @@ void PrintScheduleTable(const std::vector<PipelineParallelScheduler::Task> &sche
     }
 }
 
-std::vector<std::shared_ptr<Tensor>> PipelineSchedule::ReceiveFromPrev(int peer_rank) {
+std::vector<std::shared_ptr<Tensor>> PipelineSchedule::ReceiveFromPrev(int peer_rank, int microbatch, int boundary) {
     std::vector<std::shared_ptr<Tensor>> recv_tensors;
     auto &shapes = stage_->recv_shape();
     for (size_t i = 0; i < shapes.size(); ++i) {
@@ -83,12 +83,13 @@ std::vector<std::shared_ptr<Tensor>> PipelineSchedule::ReceiveFromPrev(int peer_
         recv_tensors.push_back(tensor);
     }
 
-    return IRecv(recv_tensors, stage_->device(), peer_rank);
+    return IRecv(recv_tensors, stage_->device(), peer_rank, utils::CurrentPipelineTraceStep(), microbatch, boundary);
 }
 
 std::vector<std::shared_ptr<Tensor>> PipelineSchedule::SendToNext(const std::vector<std::shared_ptr<Tensor>> &tensors,
-                                                                  int peer_rank) {
-    return ISend(tensors, stage_->device(), peer_rank, stage_->recv_shape());
+                                                                  int peer_rank, int microbatch, int boundary) {
+    return ISend(tensors, stage_->device(), peer_rank, stage_->recv_shape(), utils::CurrentPipelineTraceStep(),
+                 microbatch, boundary);
 }
 
 PipelineParallelScheduler::Task PipelineParallelScheduler::CreateTask(int step, int mb, int global_chunk,
@@ -347,9 +348,9 @@ float PipelineSchedule::StepMicroBatches(const std::vector<std::shared_ptr<Tenso
             } else if (layout_) {
                 const auto &previous = layout_->GetChunk(gid - 1);
                 inputs = previous.stage_id == stage_idx ? activations.at(previous.local_chunk_idx).at(mb)
-                                                        : ReceiveFromPrev(previous.stage_id);
+                                                        : ReceiveFromPrev(previous.stage_id, mb, gid - 1);
             } else {
-                inputs = ReceiveFromPrev(stage_->IsFirstStage() ? num_stages - 1 : stage_->prev_rank());
+                inputs = ReceiveFromPrev(stage_->IsFirstStage() ? num_stages - 1 : stage_->prev_rank(), mb, gid - 1);
             }
             auto &output = activations.at(local).at(mb);
             output = stage_->ForwardOneChunk(inputs, local);
@@ -357,7 +358,7 @@ float PipelineSchedule::StepMicroBatches(const std::vector<std::shared_ptr<Tenso
                 const int next_owner
                     = layout_ ? layout_->GetChunk(gid + 1).stage_id : (stage_->IsLastStage() ? 0 : stage_->next_rank());
                 if (!layout_ || next_owner != stage_idx) {
-                    output = SendToNext(output, next_owner);
+                    output = SendToNext(output, next_owner, mb, gid);
                 }
             }
         } else {

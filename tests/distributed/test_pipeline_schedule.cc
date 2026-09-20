@@ -97,6 +97,16 @@ std::string PendingRendezvous(const std::vector<Scheduler::Task> &tasks, int sta
     }
 }
 
+TEST(PipelineDiagnosticsTest, P2PTraceLabelHasStableMessageIdentity) {
+    EXPECT_EQ(utils::BuildPipelineP2PTraceLabel(12, 3, 1, 0, 4096, 2, true, false),
+              "pipeline p2p step=12 mb=3 boundary=1 direction=forward role=recv peer=0 bytes=4096 tensors=2 "
+              "message=12:3:1:forward");
+    EXPECT_EQ(utils::BuildPipelineP2PTraceLabel(12, 3, 1, 1, 4096, 2, false, true),
+              "pipeline p2p step=12 mb=3 boundary=1 direction=backward role=send peer=1 bytes=4096 tensors=2 "
+              "message=12:3:1:backward");
+    EXPECT_THROW(utils::BuildPipelineP2PTraceLabel(12, 3, 1, 0, 0, 2, true, true), std::invalid_argument);
+}
+
 TEST(PipelineScheduleTest, CommunicationOrderMakesProgressAcrossAllOwners) {
     // Exhaust two-stage owners through six chunks and three-stage owners through five.
     for (int stages : {2, 3}) {

@@ -32,8 +32,9 @@ public:
                                    const std::vector<std::shared_ptr<Tensor>> &target_mbs,
                                    const std::shared_ptr<nn::Module> &loss_fn, DataType dtype);
 
-    std::vector<std::shared_ptr<Tensor>> ReceiveFromPrev(int peer_rank);
-    std::vector<std::shared_ptr<Tensor>> SendToNext(const std::vector<std::shared_ptr<Tensor>> &tensors, int peer_rank);
+    std::vector<std::shared_ptr<Tensor>> ReceiveFromPrev(int peer_rank, int microbatch, int boundary);
+    std::vector<std::shared_ptr<Tensor>> SendToNext(const std::vector<std::shared_ptr<Tensor>> &tensors, int peer_rank,
+                                                    int microbatch, int boundary);
 
 protected:
     bool has_printed_schedule_ = false;
